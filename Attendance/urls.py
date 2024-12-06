@@ -6,7 +6,9 @@ from .views import (
     QRDetailsViewSet,
     register,
     login,
-    logout
+    logout,
+    generate_qr,
+    mark_attendance
 )
 
 router = DefaultRouter()
@@ -20,4 +22,6 @@ urlpatterns = [
     path('login/', login, name='login'),
     path('logout/', logout, name='logout'),
     path('', include(router.urls)),
+    path('generate-qr/<str:usage_type>/', generate_qr, name='generate_qr'),
+    path('attend/', mark_attendance, name='mark_attendance'),
 ] 

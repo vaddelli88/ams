@@ -67,6 +67,7 @@ class EmployeeActivity(models.Model):
     emp = models.ForeignKey(Employee, to_field='employee_id', db_column='emp_id', on_delete=models.CASCADE)
     timestamp = models.DateTimeField(auto_now_add=True)
     activity = models.CharField(max_length=9, choices=ACTIVITY_CHOICES)
+    location = models.CharField(max_length=255)
 
     class Meta:
         db_table = 'employee_activity'

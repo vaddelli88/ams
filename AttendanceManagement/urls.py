@@ -22,6 +22,8 @@ from rest_framework_simplejwt.views import (
     TokenObtainPairView,
     TokenRefreshView,
 )
+from django.conf import settings
+from django.conf.urls.static import static
 
 # Swagger documentation setup
 schema_view = get_schema_view(
@@ -45,4 +47,4 @@ urlpatterns = [
     
     # Include Attendance URLs
     path('', include('Attendance.urls')),
-]
+] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
