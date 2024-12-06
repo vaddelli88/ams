@@ -1,0 +1,57 @@
+create database attendance_manager;
+use attendance_manager;
+CREATE TABLE employee (
+    id SERIAL PRIMARY KEY,
+    employee_id CHAR(6) UNIQUE NOT NULL,
+    password VARCHAR(255) NOT NULL,
+    last_login TIMESTAMP NULL,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    username VARCHAR(150) UNIQUE NOT NULL,
+    first_name VARCHAR(50),
+    last_name VARCHAR(50),
+    date_joined TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_active BOOLEAN DEFAULT TRUE,
+    is_super BOOLEAN DEFAULT FALSE,
+    is_staff BOOLEAN DEFAULT FALSE
+);
+
+
+CREATE TABLE employee_activity (
+    id SERIAL PRIMARY KEY,
+    emp_id CHAR(6) NOT NULL,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    activity ENUM('check-in', 'check-out') NOT NULL,
+    FOREIGN KEY (emp_id) REFERENCES employee (employee_id) ON DELETE CASCADE
+);
+
+CREATE TABLE qr_details (
+    id SERIAL PRIMARY KEY,
+    unique_number VARCHAR(255) UNIQUE NOT NULL,
+    usage_type ENUM('check-in', 'check-out') NOT NULL,
+    is_valid BOOLEAN DEFAULT TRUE,
+    create_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE token_blacklist_outstandingtoken (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    token TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP NOT NULL,
+    employee_id CHAR(6) NOT NULL,  -- Changed from user_id to employee_id
+    jti VARCHAR(255) NOT NULL UNIQUE,
+    FOREIGN KEY (employee_id) REFERENCES employee(employee_id) ON DELETE CASCADE
+);
+
+CREATE TABLE token_blacklist_blacklistedtoken (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    blacklisted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    token_id BIGINT NOT NULL UNIQUE,
+    FOREIGN KEY (token_id) REFERENCES token_blacklist_outstandingtoken(id) ON DELETE CASCADE
+);
+
+ALTER TABLE token_blacklist_outstandingtoken 
+MODIFY COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+MODIFY COLUMN expires_at DATETIME NOT NULL;
+
+ALTER TABLE token_blacklist_blacklistedtoken 
+MODIFY COLUMN blacklisted_at DATETIME DEFAULT CURRENT_TIMESTAMP;
