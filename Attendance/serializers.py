@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Employee, EmployeeActivity, QRDetails
+from .models import Employee, EmployeeActivity, QRDetails, OfficeLocation
 
 class EmployeeSerializer(serializers.ModelSerializer):
     class Meta:
@@ -30,4 +30,9 @@ class QRDetailsSerializer(serializers.ModelSerializer):
     class Meta:
         model = QRDetails
         fields = ['id', 'unique_number', 'usage_type', 'is_valid', 'create_date']
-        read_only_fields = ['create_date'] 
+        read_only_fields = ['create_date']
+
+class OfficeLocationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OfficeLocation
+        fields = ['id', 'latitude', 'longitude', 'is_valid'] 

@@ -55,3 +55,18 @@ MODIFY COLUMN expires_at DATETIME NOT NULL;
 
 ALTER TABLE token_blacklist_blacklistedtoken 
 MODIFY COLUMN blacklisted_at DATETIME DEFAULT CURRENT_TIMESTAMP;
+
+CREATE TABLE office_location (
+    id SERIAL PRIMARY KEY,       -- Unique identifier for each location
+    latitude DECIMAL(9, 6) NOT NULL,  -- Latitude with up to 6 decimal places
+    longitude DECIMAL(9, 6) NOT NULL, -- Longitude with up to 6 decimal places
+    is_valid BOOLEAN DEFAULT TRUE    -- Indicates if the location is active or not
+);
+
+CREATE TABLE worked_hours (
+    id SERIAL PRIMARY KEY,
+    employee_id CHAR(6) NOT NULL,
+    work_date DATE NOT NULL,  -- Store the date for which the hours are worked
+    worked_hours DECIMAL(5,2) NOT NULL,  -- Store worked hours as a decimal (e.g., 8.5 hours)
+    FOREIGN KEY (employee_id) REFERENCES employee (employee_id) ON DELETE CASCADE
+);

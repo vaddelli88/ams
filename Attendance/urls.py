@@ -8,13 +8,15 @@ from .views import (
     login,
     logout,
     generate_qr,
-    mark_attendance
+    mark_attendance,
+    OfficeLocationViewSet,
 )
 
 router = DefaultRouter()
 router.register(r'employees', EmployeeViewSet, basename='employee')
 router.register(r'activities', EmployeeActivityViewSet, basename='activity')
 router.register(r'qr-codes', QRDetailsViewSet, basename='qr-code')
+router.register(r'office-locations', OfficeLocationViewSet, basename='office-location')
 
 # First add the registration URL, then include router URLs
 urlpatterns = [

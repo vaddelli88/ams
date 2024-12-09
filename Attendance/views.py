@@ -2,16 +2,18 @@ from django.shortcuts import render
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view, parser_classes, permission_classes
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, BasePermission
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from .models import (
     Employee, 
     EmployeeActivity, 
     QRDetails,
     OutstandingTokenModel,  # Use our custom models
-    BlacklistedTokenModel   # Use our custom models
+    BlacklistedTokenModel,   # Use our custom models
+    OfficeLocation,
+    WorkedHours
 )
-from .serializers import EmployeeSerializer, EmployeeActivitySerializer, QRDetailsSerializer
+from .serializers import EmployeeSerializer, EmployeeActivitySerializer, QRDetailsSerializer, OfficeLocationSerializer
 import uuid
 from django.contrib.auth import authenticate
 from .tokens import CustomRefreshToken
@@ -23,6 +25,11 @@ from django.core.files.base import ContentFile
 import os
 from django.conf import settings
 from datetime import datetime
+from math import radians, sin, cos, sqrt, atan2
+from decimal import Decimal
+from django.db.models import Q
+from datetime import datetime, timedelta
+from django.utils import timezone
 
 # Create your views here.
 
@@ -300,10 +307,12 @@ def generate_qr(request, usage_type):
             )
 
         # Invalidate previous QR codes of the same type
-        QRDetails.objects.filter(
+        invalidated_count = QRDetails.objects.filter(
             usage_type=usage_type,
             is_valid=True
         ).update(is_valid=False)
+
+        print(f"Invalidated {invalidated_count} previous {usage_type} QR codes")
 
         # Generate unique number
         while True:
@@ -311,7 +320,7 @@ def generate_qr(request, usage_type):
             if not QRDetails.objects.filter(unique_number=unique_number).exists():
                 break
 
-        # Create QR code record
+        # Create new QR code record
         qr_detail = QRDetails.objects.create(
             unique_number=unique_number,
             usage_type=usage_type,
@@ -326,7 +335,6 @@ def generate_qr(request, usage_type):
             border=4,
         )
         
-        # The URL that will be encoded in QR
         qr_url = f"http://{request.get_host()}/attend?code={unique_number}&type={usage_type}"
         qr.add_data(qr_url)
         qr.make(fit=True)
@@ -338,7 +346,7 @@ def generate_qr(request, usage_type):
         buffer = BytesIO()
         img.save(buffer, format='PNG')
         
-        # Create response with appropriate headers
+        # Create response
         response = HttpResponse(buffer.getvalue(), content_type='image/png')
         response['Content-Disposition'] = f'attachment; filename="{usage_type}_qr_{unique_number}.png"'
         
@@ -350,37 +358,114 @@ def generate_qr(request, usage_type):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
+def calculate_distance(lat1, lon1, lat2, lon2):
+    """
+    Calculate distance between two points using Haversine formula
+    Returns distance in meters
+    """
+    R = 6371000  # Earth's radius in meters
+
+    lat1, lon1, lat2, lon2 = map(radians, [float(lat1), float(lon1), float(lat2), float(lon2)])
+    
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    distance = R * c
+    
+    return distance
+
+def get_last_activity(employee):
+    """Get employee's last activity for validation"""
+    return EmployeeActivity.objects.filter(
+        emp=employee
+    ).order_by('-timestamp').first()
+
+def calculate_worked_hours(check_in_time, check_out_time):
+    """
+    Calculate hours worked between check-in and check-out
+    Returns time in HH.MM format (e.g., 8.30 for 8 hours 30 minutes)
+    """
+    # Make both times timezone-aware if they aren't already
+    if check_in_time.tzinfo is None:
+        check_in_time = check_in_time.replace(tzinfo=timezone.utc)
+    if check_out_time.tzinfo is None:
+        check_out_time = check_out_time.replace(tzinfo=timezone.utc)
+        
+    time_diff = check_out_time - check_in_time
+    total_minutes = time_diff.total_seconds() / 60  # Convert to minutes
+    
+    hours = int(total_minutes // 60)  # Get complete hours
+    minutes = int(total_minutes % 60)  # Get remaining minutes
+    
+    # Convert to HH.MM format
+    decimal_time = Decimal(f"{hours}.{minutes:02d}")  # :02d ensures two digits for minutes
+    return decimal_time
+
+def handle_missing_checkout(employee, last_activity):
+    """Handle cases where employee didn't check out from previous day"""
+    if last_activity and last_activity.activity == 'check-in':
+        # Get the date of last activity
+        last_date = last_activity.timestamp.date()
+        
+        # If last check-in was not today and no checkout was recorded
+        if last_date < datetime.now().date():
+            # Add default 2 hours for incomplete previous day
+            WorkedHours.objects.create(
+                emp=employee,
+                work_date=last_date,
+                worked_hours=Decimal('2.00')  # Default 2 hours for incomplete checkout
+            )
+            return True
+    return False
+
 @api_view(['POST'])
 def mark_attendance(request):
-    """
-    Handle attendance marking from QR code scans
-    Expects:
-    Query parameters:
-        - code: The unique QR code
-        - type: 'check-in' or 'check-out'
-    Request body:
-        - employee_id: Employee's ID
-        - location: Location of attendance
-    """
     try:
         # Get QR parameters from query
         code = request.query_params.get('code')
         usage_type = request.query_params.get('type')
 
-        # Get employee details from request body
+        # Get employee details and location from request body
         employee_id = request.data.get('employee_id')
-        location = request.data.get('location')
+        current_latitude = request.data.get('latitude')
+        current_longitude = request.data.get('longitude')
 
         # Validate required fields
-        if not all([code, usage_type, employee_id, location]):
+        if not all([code, usage_type, employee_id, current_latitude, current_longitude]):
             return Response({
                 'error': 'Missing required fields',
                 'required': {
                     'code': bool(code),
                     'type': bool(usage_type),
                     'employee_id': bool(employee_id),
-                    'location': bool(location)
+                    'latitude': bool(current_latitude),
+                    'longitude': bool(current_longitude)
                 }
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Get valid office location
+        office_location = OfficeLocation.objects.filter(is_valid=True).first()
+        if not office_location:
+            return Response({
+                'error': 'No valid office location found'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Calculate distance
+        distance = calculate_distance(
+            float(current_latitude),
+            float(current_longitude),
+            float(office_location.latitude),
+            float(office_location.longitude)
+        )
+
+        # Check if within 200 meters
+        if distance > 200:
+            return Response({
+                'error': 'You are too far from the office location',
+                'distance': f'{distance:.2f} meters',
+                'max_allowed': '200 meters'
             }, status=status.HTTP_400_BAD_REQUEST)
 
         # Validate QR code
@@ -403,42 +488,189 @@ def mark_attendance(request):
                 'error': f'Employee with ID {employee_id} not found'
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # Check if employee has already marked attendance for this type today
+        # Get employee's last activity
+        last_activity = get_last_activity(employee)
         today = datetime.now().date()
-        existing_activity = EmployeeActivity.objects.filter(
-            emp=employee,
-            activity=usage_type,
-            timestamp__date=today
-        ).exists()
 
-        if existing_activity:
+        # Modified activity sequence validation
+        if last_activity:
+            if usage_type == 'check-in':
+                if last_activity.activity == 'check-in':
+                    return Response({
+                        'error': 'Cannot check in: You have not checked out from your previous session',
+                        'last_activity': {
+                            'type': last_activity.activity,
+                            'timestamp': last_activity.timestamp
+                        }
+                    }, status=status.HTTP_400_BAD_REQUEST)
+                # If last activity was check-out, allow new check-in
+            elif usage_type == 'check-out':
+                if last_activity.activity == 'check-out':
+                    return Response({
+                        'error': 'Cannot check out: You have not checked in yet',
+                        'last_activity': {
+                            'type': last_activity.activity,
+                            'timestamp': last_activity.timestamp
+                        }
+                    }, status=status.HTTP_400_BAD_REQUEST)
+        elif usage_type == 'check-out':
             return Response({
-                'error': f'Already marked {usage_type} for today'
+                'error': 'Cannot check out: No previous check-in found'
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # Create attendance record
-        activity = EmployeeActivity.objects.create(
-            emp=employee,
-            activity=usage_type,
-            location=location,
-            timestamp=datetime.now()  # Current timestamp
-        )
+        # For check-out, calculate and store worked hours
+        if usage_type == 'check-out':
+            # Get today's last check-in
+            check_in = EmployeeActivity.objects.filter(
+                emp=employee,
+                activity='check-in',
+                timestamp__date=today
+            ).order_by('-timestamp').first()
 
-        # Invalidate QR code after use
-        qr_detail.is_valid = False
-        qr_detail.save()
+            if check_in:
+                # Calculate worked hours for this session
+                current_time = timezone.now()
+                session_hours = calculate_worked_hours(check_in.timestamp, current_time)
+                
+                # Get or create today's worked hours record
+                worked_hours_record, created = WorkedHours.objects.get_or_create(
+                    emp=employee,
+                    work_date=today,
+                    defaults={'worked_hours': Decimal('0.00')}
+                )
 
-        return Response({
-            'message': f'Attendance {usage_type} marked successfully',
-            'details': {
-                'employee_id': employee.employee_id,
-                'location': activity.location,
-                'timestamp': activity.timestamp,
-                'activity': activity.activity
-            }
-        }, status=status.HTTP_200_OK)
+                # Add current session hours to total
+                total_minutes = (
+                    int(str(worked_hours_record.worked_hours).split('.')[0]) * 60 +  # Hours to minutes
+                    int(str(worked_hours_record.worked_hours).split('.')[1])         # Minutes
+                ) + (
+                    int(str(session_hours).split('.')[0]) * 60 +                     # Session hours to minutes
+                    int(str(session_hours).split('.')[1])                            # Session minutes
+                )
+
+                # Convert total minutes back to HH.MM format
+                total_hours = int(total_minutes // 60)
+                total_minutes = int(total_minutes % 60)
+                worked_hours_record.worked_hours = Decimal(f"{total_hours}.{total_minutes:02d}")
+                worked_hours_record.save()
+
+                # Create check-out record
+                activity = EmployeeActivity.objects.create(
+                    emp=employee,
+                    activity=usage_type,
+                    timestamp=current_time
+                )
+
+                return Response({
+                    'message': f'Attendance {usage_type} marked successfully',
+                    'details': {
+                        'employee_id': employee.employee_id,
+                        'timestamp': activity.timestamp,
+                        'activity': activity.activity,
+                        'distance_from_office': f'{distance:.2f} meters',
+                        'session_hours': str(session_hours),
+                        'total_worked_hours': str(worked_hours_record.worked_hours)
+                    }
+                }, status=status.HTTP_200_OK)
+            else:
+                return Response({
+                    'error': 'No check-in record found for today'
+                }, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            # Regular check-in process
+            activity = EmployeeActivity.objects.create(
+                emp=employee,
+                activity=usage_type,
+                timestamp=timezone.now()
+            )
+
+            return Response({
+                'message': f'Attendance {usage_type} marked successfully',
+                'details': {
+                    'employee_id': employee.employee_id,
+                    'timestamp': activity.timestamp,
+                    'activity': activity.activity,
+                    'distance_from_office': f'{distance:.2f} meters'
+                }
+            }, status=status.HTTP_200_OK)
 
     except Exception as e:
         return Response({
             'error': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Add this new permission class
+class IsSuperuserOrStaff(BasePermission):
+    def has_permission(self, request, view):
+        return bool(request.user and (request.user.is_superuser or request.user.is_staff))
+
+class OfficeLocationViewSet(viewsets.ModelViewSet):
+    queryset = OfficeLocation.objects.all()
+    serializer_class = OfficeLocationSerializer
+
+    def get_permissions(self):
+        """
+        Only allow superusers and staff to manage office locations
+        """
+        if self.action in ['create', 'update', 'partial_update', 'destroy']:
+            return [IsAuthenticated(), IsSuperuserOrStaff()]
+        return [IsAuthenticated()]
+
+    def create(self, request, *args, **kwargs):
+        """
+        Create a new office location and invalidate previous locations
+        """
+        try:
+            # Validate required fields
+            latitude = request.data.get('latitude')
+            longitude = request.data.get('longitude')
+
+            if not latitude or not longitude:
+                return Response({
+                    'error': 'Both latitude and longitude are required'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Invalidate previous locations
+            OfficeLocation.objects.filter(is_valid=True).update(is_valid=False)
+
+            # Create new location
+            location = OfficeLocation.objects.create(
+                latitude=latitude,
+                longitude=longitude,
+                is_valid=True
+            )
+
+            serializer = self.get_serializer(location)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            return Response({
+                'error': str(e)
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+    def list(self, request, *args, **kwargs):
+        """
+        List all office locations, with option to filter valid ones
+        """
+        valid_only = request.query_params.get('valid_only', 'false').lower() == 'true'
+        queryset = self.get_queryset()
+        
+        if valid_only:
+            queryset = queryset.filter(is_valid=True)
+
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def toggle_status(self, request, pk=None):
+        """
+        Toggle the validity status of a location
+        """
+        location = self.get_object()
+        location.is_valid = not location.is_valid
+        location.save()
+
+        return Response({
+            'message': f'Location status updated to {"valid" if location.is_valid else "invalid"}',
+            'location': self.get_serializer(location).data
+        })

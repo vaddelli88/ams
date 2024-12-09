@@ -67,7 +67,6 @@ class EmployeeActivity(models.Model):
     emp = models.ForeignKey(Employee, to_field='employee_id', db_column='emp_id', on_delete=models.CASCADE)
     timestamp = models.DateTimeField(auto_now_add=True)
     activity = models.CharField(max_length=9, choices=ACTIVITY_CHOICES)
-    location = models.CharField(max_length=255)
 
     class Meta:
         db_table = 'employee_activity'
@@ -117,4 +116,24 @@ class BlacklistedTokenModel(models.Model):
 
     class Meta:
         db_table = 'token_blacklist_blacklistedtoken'
+        managed = False
+
+class OfficeLocation(models.Model):
+    id = models.AutoField(primary_key=True)
+    latitude = models.DecimalField(max_digits=9, decimal_places=6)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6)
+    is_valid = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = 'office_location'
+        managed = False
+
+class WorkedHours(models.Model):
+    id = models.AutoField(primary_key=True)
+    emp = models.ForeignKey(Employee, to_field='employee_id', db_column='employee_id', on_delete=models.CASCADE)
+    work_date = models.DateField()
+    worked_hours = models.DecimalField(max_digits=5, decimal_places=2)
+
+    class Meta:
+        db_table = 'worked_hours'
         managed = False
