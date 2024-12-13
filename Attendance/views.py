@@ -11,9 +11,13 @@ from .models import (
     OutstandingTokenModel,  # Use our custom models
     BlacklistedTokenModel,   # Use our custom models
     OfficeLocation,
-    WorkedHours
+    WorkedHours,
+    Holiday,
+    LeaveType,
+    LeaveBalance,
+    LeaveRequest
 )
-from .serializers import EmployeeSerializer, EmployeeActivitySerializer, QRDetailsSerializer, OfficeLocationSerializer
+from .serializers import EmployeeSerializer, EmployeeActivitySerializer, QRDetailsSerializer, OfficeLocationSerializer, HolidaySerializer, LeaveTypeSerializer, LeaveBalanceSerializer, LeaveRequestSerializer, WorkedHoursSerializer
 import uuid
 from django.contrib.auth import authenticate
 from .tokens import CustomRefreshToken
@@ -30,83 +34,15 @@ from decimal import Decimal
 from django.db.models import Q
 from datetime import datetime, timedelta
 from django.utils import timezone
+from django_filters import rest_framework as filters
+from rest_framework.filters import OrderingFilter
+from django.db.models import Sum, Count
+from django.db.models.functions import TruncDate, TruncHour
 
 # Create your views here.
 
-class EmployeeViewSet(viewsets.ModelViewSet):
-    queryset = Employee.objects.all()
-    serializer_class = EmployeeSerializer
-    permission_classes = [IsAuthenticated]
-    lookup_field = 'employee_id'
-
-    @action(detail=True, methods=['post'])
-    def check_in(self, request, employee_id=None):
-        try:
-            employee = self.get_object()
-            activity = EmployeeActivity.objects.create(
-                emp=employee,
-                activity='check-in'
-            )
-            serializer = EmployeeActivitySerializer(activity)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        except Exception as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-    @action(detail=True, methods=['post'])
-    def check_out(self, request, employee_id=None):
-        try:
-            employee = self.get_object()
-            activity = EmployeeActivity.objects.create(
-                emp=employee,
-                activity='check-out'
-            )
-            serializer = EmployeeActivitySerializer(activity)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        except Exception as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-class EmployeeActivityViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = EmployeeActivity.objects.all()
-    serializer_class = EmployeeActivitySerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-        queryset = super().get_queryset()
-        if not self.request.user.is_super:
-            queryset = queryset.filter(emp=self.request.user)
-        return queryset
-
-class QRDetailsViewSet(viewsets.ModelViewSet):
-    queryset = QRDetails.objects.all()
-    serializer_class = QRDetailsSerializer
-    permission_classes = [IsAuthenticated]
-
-    @action(detail=True, methods=['post'])
-    def validate_qr(self, request, pk=None):
-        qr_detail = self.get_object()
-        if not qr_detail.is_valid:
-            return Response(
-                {'error': 'QR code is invalid or expired'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Create activity based on QR type
-        activity = EmployeeActivity.objects.create(
-            emp=request.user,
-            activity=qr_detail.usage_type
-        )
-        
-        # Invalidate QR code after use
-        qr_detail.is_valid = False
-        qr_detail.save()
-        
-        return Response(
-            EmployeeActivitySerializer(activity).data,
-            status=status.HTTP_200_OK
-        )
-
+# Authentication Views
 @api_view(['POST'])
-@parser_classes([MultiPartParser, FormParser, JSONParser])
 def register(request):
     """
     Register a new employee in the system.
@@ -115,19 +51,18 @@ def register(request):
         POST
         
     Required Fields:
-        - email
-        - username
-        - first_name
-        - last_name
-        - password
+        - email: Employee's email address
+        - username: Unique username
+        - first_name: Employee's first name
+        - last_name: Employee's last name
+        - password: Account password
         
     Returns:
-        - Success: Employee details and message
-        - Error: Error message with details
+        - Success (201): Employee details and success message
+        - Error (400): Error message with details
         
-    Validation:
-        - Unique username and email
-        - Unique employee_id (auto-generated)
+    Auto-generates:
+        - employee_id: Unique 6-character ID (e.g., EMP58B)
     """
     data = request.data.copy()
     
@@ -187,6 +122,23 @@ def register(request):
 
 @api_view(['POST'])
 def login(request):
+    """
+    Authenticate employee and return JWT tokens.
+    
+    Methods:
+        POST
+        
+    Required Fields:
+        - login: Can be employee_id, email, or username
+        - password: Account password
+        
+    Returns:
+        - Success (200): 
+            - Access token
+            - Refresh token
+            - User details
+        - Error (401): Invalid credentials message
+    """
     login = request.data.get('login')
     password = request.data.get('password')
     
@@ -198,6 +150,10 @@ def login(request):
     
     user = Employee.objects.get_by_natural_key(login)
     if user and user.check_password(password):
+        # Update last_login
+        user.last_login = timezone.now()
+        user.save(update_fields=['last_login'])
+
         # Create refresh token
         refresh = CustomRefreshToken.for_user(user)
         
@@ -215,10 +171,10 @@ def login(request):
                 'first_name': user.first_name,
                 'last_name': user.last_name,
                 'date_joined': user.date_joined,
+                'last_login': user.last_login,
                 'is_active': user.is_active,
                 'is_staff': user.is_staff,
-                'is_superuser': user.is_superuser,
-                'last_activity': None
+                'is_superuser': user.is_superuser
             }
         }
         
@@ -232,6 +188,22 @@ def login(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def logout(request):
+    """
+    Blacklist the refresh token to prevent reuse.
+    
+    Methods:
+        POST
+        
+    Required Fields:
+        - refresh_token: Valid refresh token
+        
+    Returns:
+        - Success (200): Logout confirmation
+        - Error (400): Token error details
+    
+    Authentication:
+        Required
+    """
     try:
         print("Starting logout process...")
         refresh_token = request.data.get('refresh_token')
@@ -288,8 +260,21 @@ def logout(request):
 @permission_classes([IsAuthenticated])
 def generate_qr(request, usage_type):
     """
-    Generate QR code for check-in/check-out
-    usage_type should be either 'check-in' or 'check-out'
+    Generate new QR code for attendance.
+    
+    Methods:
+        GET
+        
+    Parameters:
+        usage_type: 'check-in' or 'check-out'
+        
+    Features:
+        - Generates unique QR code
+        - Invalidates previous codes
+        - Returns QR image
+        
+    Permissions:
+        Admin/Staff only
     """
     try:
         # Verify user is staff or superuser
@@ -422,6 +407,30 @@ def handle_missing_checkout(employee, last_activity):
 
 @api_view(['POST'])
 def mark_attendance(request):
+    """
+    Mark attendance using QR code.
+    
+    Methods:
+        POST
+        
+    Required Parameters:
+        - code: QR code unique number
+        - type: 'check-in' or 'check-out'
+        
+    Required Data:
+        - employee_id: Employee's ID
+        - latitude: Current latitude
+        - longitude: Current longitude
+        
+    Validations:
+        - QR code validity
+        - Location within 200m radius
+        - Proper check-in/out sequence
+        
+    Returns:
+        - Success (200): Attendance details with timestamp
+        - Error (400): Validation error details
+    """
     try:
         # Get QR parameters from query
         code = request.query_params.get('code')
@@ -487,6 +496,10 @@ def mark_attendance(request):
             return Response({
                 'error': f'Employee with ID {employee_id} not found'
             }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Update last_login instead of last_activity
+        employee.last_login = timezone.now()
+        employee.save(update_fields=['last_login'])
 
         # Get employee's last activity
         last_activity = get_last_activity(employee)
@@ -590,7 +603,8 @@ def mark_attendance(request):
                     'employee_id': employee.employee_id,
                     'timestamp': activity.timestamp,
                     'activity': activity.activity,
-                    'distance_from_office': f'{distance:.2f} meters'
+                    'distance_from_office': f'{distance:.2f} meters',
+                    'last_login': employee.last_login
                 }
             }, status=status.HTTP_200_OK)
 
@@ -605,6 +619,23 @@ class IsSuperuserOrStaff(BasePermission):
         return bool(request.user and (request.user.is_superuser or request.user.is_staff))
 
 class OfficeLocationViewSet(viewsets.ModelViewSet):
+    """
+    Manage office locations.
+    
+    Endpoints:
+        GET /office-locations/ - List locations
+        POST /office-locations/ - Add new location
+        
+    Custom Actions:
+        POST /office-locations/{id}/toggle_status/ - Toggle validity
+        
+    Features:
+        - Only one valid location at a time
+        - Automatic previous location invalidation
+        
+    Permissions:
+        Admin/Staff only for management
+    """
     queryset = OfficeLocation.objects.all()
     serializer_class = OfficeLocationSerializer
 
@@ -673,4 +704,563 @@ class OfficeLocationViewSet(viewsets.ModelViewSet):
         return Response({
             'message': f'Location status updated to {"valid" if location.is_valid else "invalid"}',
             'location': self.get_serializer(location).data
+        })
+
+class HolidayViewSet(viewsets.ModelViewSet):
+    queryset = Holiday.objects.all()
+    serializer_class = HolidaySerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        if self.action in ['create', 'update', 'partial_update', 'destroy']:
+            return [IsAuthenticated(), IsSuperuserOrStaff()]
+        return [IsAuthenticated()]
+
+class LeaveTypeViewSet(viewsets.ModelViewSet):
+    queryset = LeaveType.objects.all()
+    serializer_class = LeaveTypeSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        if self.action in ['create', 'update', 'partial_update', 'destroy']:
+            return [IsAuthenticated(), IsSuperuserOrStaff()]
+        return [IsAuthenticated()]
+
+class LeaveBalanceViewSet(viewsets.ModelViewSet):
+    serializer_class = LeaveBalanceSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        if self.request.user.is_superuser or self.request.user.is_staff:
+            return LeaveBalance.objects.all()
+        return LeaveBalance.objects.filter(employee=self.request.user)
+
+class LeaveRequestViewSet(viewsets.ModelViewSet):
+    """
+    Manage leave requests.
+    
+    Endpoints:
+        GET /leave-requests/ - List requests
+        POST /leave-requests/ - Create request
+        
+    Custom Actions:
+        POST /leave-requests/{id}/approve/ - Approve leave
+        POST /leave-requests/{id}/reject/ - Reject leave
+        
+    Features:
+        - Automatic leave balance update
+        - Leave request workflow
+        - Status tracking
+        
+    Filters:
+        - By status
+        - By date range
+        - By employee
+    """
+    serializer_class = LeaveRequestSerializer
+    permission_classes = [IsAuthenticated]
+    ordering = ['-applied_on']  # Default ordering
+
+    def get_queryset(self):
+        queryset = LeaveRequest.objects.all()
+        
+        # Basic permission filter
+        if not (self.request.user.is_superuser or self.request.user.is_staff):
+            queryset = queryset.filter(employee=self.request.user)
+        
+        # Get query parameters
+        status = self.request.query_params.get('status')
+        leave_type = self.request.query_params.get('leave_type')
+        employee_id = self.request.query_params.get('employee')
+        start_date_after = self.request.query_params.get('start_date_after')
+        start_date_before = self.request.query_params.get('start_date_before')
+        order_by = self.request.query_params.get('order_by', '-applied_on')
+
+        # Apply filters
+        if status:
+            queryset = queryset.filter(status=status)
+        if leave_type:
+            queryset = queryset.filter(leave_type=leave_type)
+        if employee_id and (self.request.user.is_superuser or self.request.user.is_staff):
+            queryset = queryset.filter(employee__employee_id=employee_id)
+        if start_date_after:
+            queryset = queryset.filter(start_date__gte=start_date_after)
+        if start_date_before:
+            queryset = queryset.filter(start_date__lte=start_date_before)
+
+        # Apply ordering
+        valid_order_fields = ['start_date', '-start_date', 'applied_on', '-applied_on', 'status', '-status']
+        if order_by in valid_order_fields:
+            queryset = queryset.order_by(order_by)
+            
+        return queryset.select_related('employee', 'leave_type', 'approved_by')
+
+    def create(self, request, *args, **kwargs):
+        # Add employee to request data
+        data = request.data.copy()
+        data['employee'] = request.user.employee_id
+        
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    def perform_create(self, serializer):
+        serializer.save(employee=self.request.user)
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        if not (request.user.is_superuser or request.user.is_staff):
+            return Response(
+                {'error': 'You do not have permission to approve leaves'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        leave_request = self.get_object()
+        leave_request.status = 'approved'
+        leave_request.approved_by = request.user
+        leave_request.response_on = timezone.now()
+        leave_request.response_note = request.data.get('note', '')
+        leave_request.save()
+
+        # Update leave balance
+        balance = LeaveBalance.objects.get(
+            employee=leave_request.employee,
+            leave_type=leave_request.leave_type,
+            year=leave_request.start_date.year
+        )
+        
+        # Calculate days
+        days = (leave_request.end_date - leave_request.start_date).days + 1
+        balance.used += Decimal(str(days))
+        balance.save()
+
+        return Response({
+            'message': 'Leave request approved successfully',
+            'leave_request': LeaveRequestSerializer(leave_request).data
+        })
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        if not (request.user.is_superuser or request.user.is_staff):
+            return Response(
+                {'error': 'You do not have permission to reject leaves'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        leave_request = self.get_object()
+        leave_request.status = 'rejected'
+        leave_request.approved_by = request.user
+        leave_request.response_on = timezone.now()
+        leave_request.response_note = request.data.get('note', '')
+        leave_request.save()
+
+        return Response({
+            'message': 'Leave request rejected successfully',
+            'leave_request': LeaveRequestSerializer(leave_request).data
+        })
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def auto_attend(request):
+    """
+    Automatically mark attendance based on location.
+    
+    Methods:
+        POST
+        
+    Required Data:
+        - latitude: Current latitude
+        - longitude: Current longitude
+        
+    Features:
+        - Auto check-in when entering office radius
+        - Auto check-out when leaving office radius
+        - Calculates worked hours on check-out
+        
+    Returns:
+        - Success (200): Attendance status and details
+        - Error (400): Location/validation errors
+    """
+    try:
+        # Get location from request
+        current_latitude = request.data.get('latitude')
+        current_longitude = request.data.get('longitude')
+        employee_id = request.user.employee_id
+
+        if not all([current_latitude, current_longitude]):
+            return Response({
+                'error': 'Location coordinates are required',
+                'required': {
+                    'latitude': bool(current_latitude),
+                    'longitude': bool(current_longitude)
+                }
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Get valid office location
+        office_location = OfficeLocation.objects.filter(is_valid=True).first()
+        if not office_location:
+            return Response({
+                'error': 'No valid office location found'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Calculate distance
+        distance = calculate_distance(
+            float(current_latitude),
+            float(current_longitude),
+            float(office_location.latitude),
+            float(office_location.longitude)
+        )
+
+        # Get employee's last activity
+        last_activity = get_last_activity(request.user)
+        current_time = timezone.now()
+        today = current_time.date()
+
+        # If within office radius (200 meters)
+        if distance <= 200:
+            # If no previous activity or last activity was check-out
+            if not last_activity or last_activity.activity == 'check-out':
+                # Create check-in record
+                activity = EmployeeActivity.objects.create(
+                    emp=request.user,
+                    activity='check-in',
+                    timestamp=current_time
+                )
+
+                # Update last login
+                request.user.last_login = current_time
+                request.user.save(update_fields=['last_login'])
+
+                return Response({
+                    'message': 'Auto check-in successful',
+                    'details': {
+                        'employee_id': employee_id,
+                        'timestamp': activity.timestamp,
+                        'activity': 'check-in',
+                        'distance_from_office': f'{distance:.2f} meters'
+                    }
+                }, status=status.HTTP_200_OK)
+            else:
+                return Response({
+                    'message': 'Already checked in',
+                    'details': {
+                        'last_activity': last_activity.activity,
+                        'timestamp': last_activity.timestamp,
+                        'distance_from_office': f'{distance:.2f} meters'
+                    }
+                }, status=status.HTTP_200_OK)
+
+        # If outside office radius
+        else:
+            # If last activity was check-in, create check-out
+            if last_activity and last_activity.activity == 'check-in':
+                # Create check-out record
+                activity = EmployeeActivity.objects.create(
+                    emp=request.user,
+                    activity='check-out',
+                    timestamp=current_time
+                )
+
+                # Calculate and store worked hours
+                check_in = EmployeeActivity.objects.filter(
+                    emp=request.user,
+                    activity='check-in',
+                    timestamp__date=today
+                ).order_by('-timestamp').first()
+
+                if check_in:
+                    session_hours = calculate_worked_hours(check_in.timestamp, current_time)
+                    worked_hours_record, created = WorkedHours.objects.get_or_create(
+                        emp=request.user,
+                        work_date=today,
+                        defaults={'worked_hours': Decimal('0.00')}
+                    )
+
+                    # Add current session hours to total
+                    total_minutes = (
+                        int(str(worked_hours_record.worked_hours).split('.')[0]) * 60 +
+                        int(str(worked_hours_record.worked_hours).split('.')[1]) +
+                        int(str(session_hours).split('.')[0]) * 60 +
+                        int(str(session_hours).split('.')[1])
+                    )
+
+                    total_hours = int(total_minutes // 60)
+                    total_minutes = int(total_minutes % 60)
+                    worked_hours_record.worked_hours = Decimal(f"{total_hours}.{total_minutes:02d}")
+                    worked_hours_record.save()
+
+                return Response({
+                    'message': 'Auto check-out successful',
+                    'details': {
+                        'employee_id': employee_id,
+                        'timestamp': activity.timestamp,
+                        'activity': 'check-out',
+                        'distance_from_office': f'{distance:.2f} meters',
+                        'session_hours': str(session_hours),
+                        'total_worked_hours': str(worked_hours_record.worked_hours)
+                    }
+                }, status=status.HTTP_200_OK)
+
+            return Response({
+                'message': 'Outside office radius',
+                'details': {
+                    'distance_from_office': f'{distance:.2f} meters',
+                    'max_allowed': '200 meters'
+                }
+            }, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        return Response({
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class AttendanceLogsViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    View detailed attendance logs and analytics.
+    
+    Endpoints:
+        GET /attendance-logs/ - List all logs
+        GET /attendance-logs/summary/ - Get summary
+        GET /attendance-logs/employee_stats/ - Get employee statistics
+        
+    Features:
+        - Detailed attendance records
+        - Working hours calculation
+        - Activity patterns
+        - Leave integration
+        
+    Filters:
+        - By date range
+        - By employee
+        - By activity type
+    """
+    permission_classes = [IsAuthenticated]
+    serializer_class = EmployeeActivitySerializer
+
+    def get_queryset(self):
+        queryset = EmployeeActivity.objects.all()
+        
+        # Basic permission filter
+        if not (self.request.user.is_superuser or self.request.user.is_staff):
+            return queryset.filter(emp=self.request.user)
+
+        # Get query parameters
+        employee_id = self.request.query_params.get('employee')
+        start_date = self.request.query_params.get('start_date')
+        end_date = self.request.query_params.get('end_date')
+        activity_type = self.request.query_params.get('activity')
+        hour = self.request.query_params.get('hour')
+        
+        # Apply filters
+        if employee_id:
+            queryset = queryset.filter(emp__employee_id=employee_id)
+        if start_date:
+            queryset = queryset.filter(timestamp__date__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(timestamp__date__lte=end_date)
+        if activity_type:
+            queryset = queryset.filter(activity=activity_type)
+        if hour:
+            queryset = queryset.filter(timestamp__hour=hour)
+
+        return queryset.select_related('emp').order_by('-timestamp')
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        """Get attendance summary with worked hours"""
+        queryset = self.get_queryset()
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        employee_id = request.query_params.get('employee')
+
+        # Get worked hours
+        worked_hours = WorkedHours.objects.all()
+        if not (request.user.is_superuser or request.user.is_staff):
+            worked_hours = worked_hours.filter(emp=request.user)
+        if employee_id:
+            worked_hours = worked_hours.filter(emp__employee_id=employee_id)
+        if start_date:
+            worked_hours = worked_hours.filter(work_date__gte=start_date)
+        if end_date:
+            worked_hours = worked_hours.filter(work_date__lte=end_date)
+
+        # Get activity counts by date
+        activity_counts = queryset.annotate(
+            date=TruncDate('timestamp')
+        ).values('date', 'activity').annotate(
+            count=Count('id')
+        ).order_by('date')
+
+        # Get hourly distribution
+        hourly_distribution = queryset.annotate(
+            hour=TruncHour('timestamp')
+        ).values('hour', 'activity').annotate(
+            count=Count('id')
+        ).order_by('hour')
+
+        return Response({
+            'worked_hours': worked_hours.values(
+                'work_date', 
+                'emp__employee_id', 
+                'emp__username',
+                'worked_hours'
+            ),
+            'activity_counts': activity_counts,
+            'hourly_distribution': hourly_distribution,
+            'total_worked_hours': worked_hours.aggregate(
+                total=Sum('worked_hours')
+            )
+        })
+
+    @action(detail=False, methods=['get'])
+    def employee_stats(self, request):
+        """Get detailed statistics for specific employee(s)"""
+        employee_id = request.query_params.get('employee')
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+
+        # Base queryset for employees
+        employees = Employee.objects.all()
+        if not (request.user.is_superuser or request.user.is_staff):
+            employees = employees.filter(employee_id=request.user.employee_id)
+        elif employee_id:
+            employees = employees.filter(employee_id=employee_id)
+
+        stats = []
+        for emp in employees:
+            # Get attendance records
+            activities = EmployeeActivity.objects.filter(emp=emp)
+            if start_date:
+                activities = activities.filter(timestamp__date__gte=start_date)
+            if end_date:
+                activities = activities.filter(timestamp__date__lte=end_date)
+
+            # Get worked hours
+            worked_hours = WorkedHours.objects.filter(emp=emp)
+            if start_date:
+                worked_hours = worked_hours.filter(work_date__gte=start_date)
+            if end_date:
+                worked_hours = worked_hours.filter(work_date__lte=end_date)
+
+            # Get leave records
+            leaves = LeaveRequest.objects.filter(employee=emp)
+            if start_date:
+                leaves = leaves.filter(start_date__gte=start_date)
+            if end_date:
+                leaves = leaves.filter(end_date__lte=end_date)
+
+            stats.append({
+                'employee_id': emp.employee_id,
+                'username': emp.username,
+                'attendance': activities.values('timestamp', 'activity'),
+                'worked_hours': worked_hours.values('work_date', 'worked_hours'),
+                'total_worked_hours': worked_hours.aggregate(total=Sum('worked_hours')),
+                'leaves': leaves.values(
+                    'start_date', 
+                    'end_date', 
+                    'leave_type__name',
+                    'status'
+                ),
+                'check_in_distribution': activities.filter(
+                    activity='check-in'
+                ).annotate(
+                    hour=TruncHour('timestamp')
+                ).values('hour').annotate(
+                    count=Count('id')
+                ).order_by('hour')
+            })
+
+        return Response(stats)
+
+class WorkedHoursViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    View worked hours records.
+    
+    Endpoints:
+        GET /worked-hours/ - List all records
+        GET /worked-hours/daily_hours/ - Day-wise breakdown
+        GET /worked-hours/date_wise/ - Date specific records
+        GET /worked-hours/total_hours/ - Total hours calculation
+        
+    Features:
+        - Daily hours tracking
+        - Total hours calculation
+        - Multiple session support
+        
+    Filters:
+        - By date range
+        - By employee
+        - By specific date
+    """
+    permission_classes = [IsAuthenticated]
+    serializer_class = WorkedHoursSerializer
+
+    def get_queryset(self):
+        queryset = WorkedHours.objects.all()
+        
+        # Regular employees can only see their own records
+        if not (self.request.user.is_superuser or self.request.user.is_staff):
+            return queryset.filter(emp=self.request.user)
+
+        # Get query parameters
+        employee_id = self.request.query_params.get('employee')
+        date = self.request.query_params.get('date')  # For specific date
+        start_date = self.request.query_params.get('start_date')
+        end_date = self.request.query_params.get('end_date')
+        
+        # Apply filters
+        if employee_id:
+            queryset = queryset.filter(emp__employee_id=employee_id)
+        if date:  # Exact date match
+            queryset = queryset.filter(work_date=date)
+        if start_date:
+            queryset = queryset.filter(work_date__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(work_date__lte=end_date)
+
+        return queryset.select_related('emp')
+
+    @action(detail=False, methods=['get'])
+    def daily_hours(self, request):
+        """Get day-wise worked hours"""
+        queryset = self.get_queryset()
+        return Response({
+            'daily_hours': queryset.values(
+                'work_date', 
+                'emp__employee_id', 
+                'emp__username', 
+                'worked_hours'
+            ).order_by('-work_date'),
+            'total_days': queryset.count()
+        })
+
+    @action(detail=False, methods=['get'])
+    def date_wise(self, request):
+        """Get worked hours for specific date"""
+        date = request.query_params.get('date')
+        if not date:
+            return Response({
+                'error': 'Date parameter is required (YYYY-MM-DD)'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        queryset = self.get_queryset().filter(work_date=date)
+        return Response({
+            'date': date,
+            'records': queryset.values(
+                'emp__employee_id',
+                'emp__username',
+                'worked_hours'
+            ).order_by('emp__employee_id')
+        })
+
+    @action(detail=False, methods=['get'])
+    def total_hours(self, request):
+        """Get total worked hours for employee(s)"""
+        queryset = self.get_queryset()
+        total = queryset.aggregate(total=Sum('worked_hours'))
+        
+        return Response({
+            'total_hours': str(total['total'] or 0)
         })

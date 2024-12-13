@@ -38,6 +38,7 @@ class Employee(AbstractBaseUser, PermissionsMixin):
     first_name = models.CharField(max_length=50, blank=True)
     last_name = models.CharField(max_length=50, blank=True)
     date_joined = models.DateTimeField(auto_now_add=True)
+    last_login = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
     is_superuser = models.BooleanField(db_column='is_super', default=False)
     is_staff = models.BooleanField(default=False)
@@ -136,4 +137,63 @@ class WorkedHours(models.Model):
 
     class Meta:
         db_table = 'worked_hours'
+        managed = False
+
+class Holiday(models.Model):
+    id = models.AutoField(primary_key=True)
+    name = models.CharField(max_length=100)
+    date = models.DateField()
+    description = models.TextField(null=True, blank=True)
+    is_company_holiday = models.BooleanField(default=True)  # True for company, False for public holidays
+
+    class Meta:
+        db_table = 'holidays'
+        managed = False
+
+class LeaveType(models.Model):
+    id = models.AutoField(primary_key=True)
+    name = models.CharField(max_length=50)  # e.g., Sick, Vacation
+    description = models.TextField(null=True, blank=True)
+    max_days_per_year = models.IntegerField()
+
+    class Meta:
+        db_table = 'leave_types'
+        managed = False
+
+class LeaveBalance(models.Model):
+    id = models.AutoField(primary_key=True)
+    employee = models.ForeignKey(Employee, to_field='employee_id', db_column='employee_id', on_delete=models.CASCADE)
+    leave_type = models.ForeignKey(LeaveType, on_delete=models.CASCADE)
+    year = models.IntegerField()
+    balance = models.DecimalField(max_digits=5, decimal_places=2)
+    used = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+
+    class Meta:
+        db_table = 'leave_balances'
+        managed = False
+
+class LeaveRequest(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+        ('cancelled', 'Cancelled')
+    ]
+
+    id = models.AutoField(primary_key=True)
+    employee = models.ForeignKey(Employee, to_field='employee_id', db_column='employee_id', on_delete=models.CASCADE)
+    leave_type = models.ForeignKey(LeaveType, on_delete=models.CASCADE)
+    start_date = models.DateField()
+    end_date = models.DateField()
+    reason = models.TextField()
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
+    applied_on = models.DateTimeField(auto_now_add=True)
+    approved_by = models.ForeignKey(Employee, to_field='employee_id', db_column='approved_by', 
+                                  related_name='approved_leaves', null=True, blank=True, 
+                                  on_delete=models.SET_NULL)
+    response_on = models.DateTimeField(null=True, blank=True)
+    response_note = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'leave_requests'
         managed = False
